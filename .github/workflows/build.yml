@@ -1,0 +1,214 @@
+name: build
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'master'
+      - 'v[0-9]*'
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - 'master'
+      - 'v[0-9]*'
+
+env:
+  REPO_SLUG: "docker/buildx-bin"
+  RELEASE_OUT: "./release-out"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v3
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        with:
+          version: latest
+      -
+        name: Test
+        uses: docker/bake-action@v2
+        with:
+          targets: test
+          set: |
+            *.cache-from=type=gha,scope=test
+            *.cache-to=type=gha,scope=test
+      -
+        name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage/coverage.txt
+
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.platforms.outputs.matrix }}
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v3
+      -
+        name: Create matrix
+        id: platforms
+        run: |
+          echo ::set-output name=matrix::$(docker buildx bake binaries-cross --print | jq -cr '.target."binaries-cross".platforms')
+      -
+        name: Show matrix
+        run: |
+          echo ${{ steps.platforms.outputs.matrix }}
+
+  binaries:
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      -
+        name: Prepare
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+      -
+        name: Checkout
+        uses: actions/checkout@v3
+      -
+        name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        with:
+          version: latest
+      -
+        name: Build
+        uses: docker/bake-action@v2
+        with:
+          targets: release
+          set: |
+            *.platform=${{ matrix.platform }}
+            *.cache-from=type=gha,scope=binaries-${{ env.PLATFORM_PAIR }}
+            *.cache-to=type=gha,scope=binaries-${{ env.PLATFORM_PAIR }},mode=max
+      -
+        name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: buildx
+          path: ${{ env.RELEASE_OUT }}/*
+          if-no-files-found: error
+
+  bin-image:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' }}
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v3
+      -
+        name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        with:
+          version: latest
+      -
+        name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: |
+            ${{ env.REPO_SLUG }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+          bake-target: meta-helper
+      -
+        name: Login to DockerHub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      -
+        name: Build and push image
+        uses: docker/bake-action@v2
+        with:
+          files: |
+            ./docker-bake.hcl
+            ${{ steps.meta.outputs.bake-file }}
+          targets: image-cross
+          push: ${{ github.event_name != 'pull_request' }}
+          set: |
+            *.cache-from=type=gha,scope=bin-image
+            *.cache-to=type=gha,scope=bin-image,mode=max
+
+  release:
+    runs-on: ubuntu-latest
+    needs:
+      - binaries
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v3
+      -
+        name: Download binaries
+        uses: actions/download-artifact@v3
+        with:
+          name: buildx
+          path: ${{ env.RELEASE_OUT }}
+      -
+        name: Create checksums
+        run: ./hack/hash-files
+      -
+        name: List artifacts
+        run: |
+          tree -nh ${{ env.RELEASE_OUT }}
+      -
+        name: Check artifacts
+        run: |
+          find ${{ env.RELEASE_OUT }} -type f -exec file -e ascii -- {} +
+      -
+        name: GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@1e07f4398721186383de40550babbdf2b84acfc5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          draft: true
+          files: ${{ env.RELEASE_OUT }}/*
+
+  buildkit-edge:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v3
+      -
+        name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        with:
+          version: latest
+          driver-opts: image=moby/buildkit:master
+          buildkitd-flags: --debug
+      -
+        # Just run a bake target to check eveything runs fine
+        name: Build
+        uses: docker/bake-action@v2
+        with:
+          targets: binaries
