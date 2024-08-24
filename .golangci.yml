@@ -1,0 +1,40 @@
+run:
+  timeout: 10m
+  skip-files:
+    - ".*\\.pb\\.go$"
+
+  modules-download-mode: vendor
+
+  build-tags:
+
+linters:
+  enable:
+    - gofmt
+    - govet
+    - deadcode
+    - depguard
+    - goimports
+    - ineffassign
+    - misspell
+    - unused
+    - varcheck
+    - revive
+    - staticcheck
+    - typecheck
+    - nolintlint
+  disable-all: true
+
+linters-settings:
+  depguard:
+    list-type: blacklist
+    include-go-root: true
+    packages:
+      # The io/ioutil package has been deprecated.
+      # https://go.dev/doc/go1.16#ioutil
+      - io/ioutil
+
+issues:
+  exclude-rules:
+    - linters:
+        - revive
+      text: "stutters"
